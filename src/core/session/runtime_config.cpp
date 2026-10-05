@@ -8,6 +8,23 @@ static void runtime_config_init_cpus(config::RuntimeConfig *config) {
     config->main_cpu = 0;
     config->consumer_cpu = 1;
 
+    /* Environment override (vivo PD2338 fix): the fast route pair must be
+     * pinned to two big cores (3/4 on the 8-core SD8 Gen2 family) and the
+     * best pair is device-specific. GHOSTLOCK_MAIN_CPU / GHOSTLOCK_CONSUMER_CPU
+     * let a launch wrapper force the pair without touching any profile; the
+     * profile's execution.selected_cpus still wins when the caller leaves the
+     * environment unset (apply_profile runs later and is authoritative). */
+    const char *env_main = getenv("GHOSTLOCK_MAIN_CPU");
+    const char *env_consumer = getenv("GHOSTLOCK_CONSUMER_CPU");
+    if (env_main && env_main[0]) {
+        const int parsed = atoi(env_main);
+        if (parsed >= 0 && parsed < CPU_SETSIZE) config->main_cpu = parsed;
+    }
+    if (env_consumer && env_consumer[0]) {
+        const int parsed = atoi(env_consumer);
+        if (parsed >= 0 && parsed < CPU_SETSIZE) config->consumer_cpu = parsed;
+    }
+
     if (config->main_cpu == config->consumer_cpu) {
         config->main_cpu = 0;
         config->consumer_cpu = 1;

@@ -581,6 +581,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             val binary = File(appContext.applicationInfo.nativeLibraryDir, binaryName)
             require(binary.isFile) { "missing native binary: ${binary.absolutePath}" }
             if (prepareKsud(workDir, onLog) != null) onLog("<k> ksud ready") else onLog("<k> warning: ksud not found")
+            val ksuVivoKo = prepareKsuVivoBundle(workDir, onLog)
             // U01-S14: a per-run KernelSU log path so a previous run's markers
             // can never satisfy the handoff probe; passed to the native process.
             val ksuLog = File(workDir, ksuLogName(System.currentTimeMillis()))
@@ -656,6 +657,15 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                     environment()["TMPDIR"] = workDir.absolutePath
                     environment()["HOME"] = workDir.absolutePath
                     environment()["GHOSTLOCK_KSU_LOG"] = ksuLog.absolutePath
+                    // direct vendor-module path: see prepareKsuVivoBundle. Default keeps
+                    // SELinux enforcing — the live-policy unlabeled-packet patches the
+                    // script applies are sufficient for full connectivity under
+                    // enforcing (verified on vivo 16.x); set GHOSTLOCK_KSU_ENFORCE=0
+                    // only for kernels where enforcing breaks userspace beyond DNS.
+                    if (ksuVivoKo != null) {
+                        environment()["GHOSTLOCK_KSU_KO"] = ksuVivoKo.absolutePath
+                        environment()["GHOSTLOCK_KSU_ENFORCE"] = "1"
+                    }
                 }
             onLog("<b> starting native: ${binary.absolutePath}")
             resetRunState()
@@ -1076,6 +1086,34 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         }
         if (!installed) onLog("<k> KernelSU/ReSukiSU/KowSU app not installed")
         return null
+    }
+
+    /* vivo PD2338 direct-module bundle (ReSukiSU-35184 ksud + natively built
+     * kernelsu-vivo.ko). The vendor kernel's uname -r carries no KMI token, so
+     * the KMI-based ksud late-load cannot select a module; the root script
+     * takes a direct `ksud insmod` branch when GHOSTLOCK_KSU_KO is set. The
+     * bundled ksud overwrites any manager-derived copy so the module/daemon
+     * handshake versions are guaranteed to match.
+     *
+     * PER-KERNEL RULE: kernelsu-vivo.ko is bound to one exact kernel build
+     * (vermagic byte-match + struct-module layout from that kernel's .config).
+     * A PD2338 OTA that changes the kernel release requires rebuilding and
+     * re-staging the asset; this bundle is NOT reusable across kernel
+     * versions even on the same device. */
+    private fun prepareKsuVivoBundle(workDir: File, onLog: (String) -> Unit): File? {
+        return runCatching {
+            val ksudOut = File(workDir, "ksud")
+            appContext.assets.open("ksu_vivo/ksud").use { input ->
+                ksudOut.outputStream().use { input.copyTo(it) }
+            }
+            runCatching { Os.chmod(ksudOut.absolutePath, 448) }
+            val koOut = File(workDir, "kernelsu-vivo.ko")
+            appContext.assets.open("ksu_vivo/kernelsu-vivo.ko").use { input ->
+                koOut.outputStream().use { input.copyTo(it) }
+            }
+            onLog("<k> ksu_vivo bundle ready: ksud(ReSukiSU-35184) + kernelsu-vivo.ko")
+            koOut
+        }.onFailure { onLog("<k> ksu_vivo bundle failed: ${it.message}") }.getOrNull()
     }
 
     private suspend fun runProcess(

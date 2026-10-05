@@ -5,6 +5,16 @@
 
 #include "kernel/offset.h"
 
+/* kernelsnitch/utils.h leaks `#define PAGE_SIZE 4096` / `#define PAGE_SHIFT`
+ * into every TU that includes it before this header (via common.h), which
+ * turns the constexpr declarations below into syntax errors. Pop the macros
+ * for this header and restore them afterwards so kernelsnitch code that
+ * still expects them keeps compiling. */
+#pragma push_macro("PAGE_SIZE")
+#pragma push_macro("PAGE_SHIFT")
+#undef PAGE_SIZE
+#undef PAGE_SHIFT
+
 namespace ghostlock::kernel {
     inline constexpr unsigned PAGE_SHIFT = 12;
     inline constexpr unsigned long PAGE_SIZE = 1UL << PAGE_SHIFT;
@@ -56,5 +66,8 @@ namespace ghostlock::kernel {
     /* Measured direct-map end (defaults to the built-in bound). */
     extern uint64_t g_direct_map_end;
 } // namespace ghostlock::kernel
+
+#pragma pop_macro("PAGE_SHIFT")
+#pragma pop_macro("PAGE_SIZE")
 
 #endif

